@@ -16,7 +16,13 @@ import secrets
 import sqlite3
 import sys
 import time
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+import uuid as _uuid
+import ssl
+import urllib.error
+import urllib.request
+import urllib.parse
+from http.cookiejar import CookieJar
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 from flask import (Flask, abort, flash, g, redirect, render_template,
                    request, session)
@@ -87,6 +93,8 @@ def init_db():
     create table if not exists attempts(ip text, kind text, ts integer);
     create index if not exists ix_att on attempts(ip, kind, ts);
     """)
+    if "uuid" not in [r[1] for r in c.execute("pragma table_info(users)")]:
+        c.execute("alter table users add column uuid text")
     c.commit()
     c.close()
     os.chmod(DB_PATH, 0o600)
@@ -105,8 +113,20 @@ def set_setting(k, v):
 
 # ------------------------------------------------------- تبدیل کانفیگ
 
-EMPTY_OP = {"name": "", "address": "", "port": "", "sni": "", "host": "", "remark": ""}
+N_OPS = 4
+EMPTY_OP = {"name": "", "scheme": "vless", "id": "", "address": "", "port": "", "remark": ""}
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-:\[\]]{1,253}$")
+KEY_RE = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
+_XRAY = ["type", "security", "encryption", "flow", "sni", "host", "path", "mode", "fp", "alpn",
+         "ech", "pbk", "sid", "spx", "serviceName", "authority", "headerType", "seed",
+         "extra", "fm", "insecure", "allowInsecure"]
+KNOWN = {  # فیلدهایی که همیشه نمایش داده می‌شوند (اگر در لینک نباشند خالی می‌مانند)
+    "vless": _XRAY,
+    "trojan": _XRAY,
+    "vmess": ["net", "type", "host", "path", "tls", "sni", "alpn", "fp", "scy", "aid"],
+    "ss": ["plugin", "type", "security", "sni", "host", "path"],
+}
+LONG_KEYS = {"extra", "fm", "ech", "alpn", "path", "pbk"}
 
 
 def split_hostport(hp):
@@ -125,73 +145,107 @@ def join_hostport(h, p):
     return f"{h}:{p}" if p else h
 
 
-def transform(link, op):
-    """لینک vmess/vless/trojan/ss را با تنظیمات اپراتور تغییر می‌دهد."""
-    link = link.strip()
-    if "://" not in link:
-        raise ValueError("فرمت لینک نامعتبر است")
+def norm_op(o):
+    d = dict(EMPTY_OP)
+    d.update({k: str(o.get(k, "")) for k in EMPTY_OP if k != "scheme"})
+    d["scheme"] = o.get("scheme") if o.get("scheme") in KNOWN else "vless"
+    d["params"] = {str(k): str(v) for k, v in (o.get("params") or {}).items()}
+    return d
+
+
+def get_ops():
+    saved = list(get_setting("ops", []))
+    saved += [{}] * (N_OPS - len(saved))
+    return [norm_op(o) for o in saved[:N_OPS]]
+
+
+def parse_link(link):
+    """لینک را به فیلدهای جدا تبدیل می‌کند (فیلدهای ناموجود خالی می‌مانند)."""
+    link = (link or "").strip()
+    if "\n" in link or "://" not in link:
+        raise ValueError("یک لینک کامل در یک خط وارد کنید")
     scheme = link.split("://", 1)[0].lower()
+    if scheme not in KNOWN:
+        raise ValueError("فقط vmess / vless / trojan / ss پشتیبانی می‌شود")
     if scheme == "vmess":
         raw = link[8:].strip()
         try:
             j = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)))
+            assert isinstance(j, dict)
         except Exception:
             raise ValueError("vmess نامعتبر است")
-        if op["address"]:
-            j["add"] = op["address"]
-        if op["port"]:
-            j["port"] = str(op["port"])
-        if op["sni"]:
-            j["sni"] = op["sni"]
-        if op["host"]:
-            j["host"] = op["host"]
-        if op["remark"]:
-            j["ps"] = op["remark"]
+        params = {k: str(j.get(k, "")) for k in KNOWN["vmess"]}
+        for k, v in j.items():
+            if k not in params and k not in ("v", "ps", "add", "port", "id") and KEY_RE.match(str(k)):
+                params[str(k)] = str(v)
+        return {"scheme": "vmess", "id": str(j.get("id", "")), "address": str(j.get("add", "")),
+                "port": str(j.get("port", "")), "remark": str(j.get("ps", "")), "params": params}
+    u = urlsplit(link)
+    userinfo, at, hp = u.netloc.rpartition("@")
+    if not at:
+        raise ValueError("فرمت لینک پشتیبانی نمی‌شود")
+    host, port = split_hostport(hp)
+    params = {k: "" for k in KNOWN[scheme]}
+    for k, v in parse_qsl(u.query, keep_blank_values=True):
+        if KEY_RE.match(k):
+            params[k] = v
+    return {"scheme": scheme, "id": userinfo, "address": host, "port": port,
+            "remark": unquote(u.fragment), "params": params}
+
+
+def build_link(c):
+    """از فیلدها لینک نهایی می‌سازد؛ فیلدهای خالی در لینک نمی‌آیند."""
+    if not c["id"] or not c["address"]:
+        raise ValueError("مشخصات ناقص است (UUID و Address لازم‌اند)")
+    if c["scheme"] == "vmess":
+        j = {"v": "2", "ps": c["remark"], "add": c["address"], "port": c["port"], "id": c["id"]}
+        j.update({k: v for k, v in c["params"].items() if v != ""})
         out = json.dumps(j, ensure_ascii=False, separators=(",", ":"))
         return "vmess://" + base64.b64encode(out.encode()).decode()
-    if scheme in ("vless", "trojan", "ss"):
-        u = urlsplit(link)
-        userinfo, at, hp = u.netloc.rpartition("@")
-        if not at:
-            raise ValueError("فرمت لینک پشتیبانی نمی‌شود")
-        host, port = split_hostport(hp)
-        if op["address"]:
-            host = op["address"]
-        if op["port"]:
-            port = str(op["port"])
-        q = parse_qsl(u.query, keep_blank_values=True)
-        for key, val in (("sni", op["sni"]), ("host", op["host"])):
-            if val:
-                q = [(k, v) for k, v in q if k != key] + [(key, val)]
-        frag = quote(op["remark"]) if op["remark"] else u.fragment
-        return urlunsplit((u.scheme, f"{userinfo}@{join_hostport(host, port)}",
-                           u.path, urlencode(q, quote_via=quote), frag))
-    raise ValueError("فقط vmess / vless / trojan / ss پشتیبانی می‌شود")
+    q = [(k, v) for k, v in c["params"].items() if v != ""]
+    return urlunsplit((c["scheme"], f"{c['id']}@{join_hostport(c['address'], c['port'])}", "",
+                       urlencode(q, quote_via=quote), quote(c["remark"])))
 
 
-def clean_op(form, i):
-    op = {k: (form.get(f"op{i}_{k}") or "").strip() for k in EMPTY_OP}
-    for k in ("address", "sni", "host"):
-        if op[k] and not HOST_RE.match(op[k]):
-            raise ValueError(f"مقدار «{k}» اپراتور {i + 1} نامعتبر است")
-    if op["port"] and not (op["port"].isdigit() and 1 <= int(op["port"]) <= 65535):
-        raise ValueError(f"پورت اپراتور {i + 1} نامعتبر است")
-    if len(op["remark"]) > 80 or len(op["name"]) > 40 or "\n" in op["remark"]:
-        raise ValueError(f"نام یا remark اپراتور {i + 1} نامعتبر است")
-    return op
+def field_keys(op):
+    base = KNOWN[op["scheme"]]
+    return base + [k for k in op["params"] if k not in base]
 
 
-def build_configs():
-    tpl = get_setting("template", "")
-    ops = get_setting("ops", [dict(EMPTY_OP), dict(EMPTY_OP)])
+def read_op(form, i, old):
+    old = norm_op(old)
+    c = dict(old)
+    pre = f"op{i}_"
+    for k in ("name", "id", "address", "port", "remark"):
+        c[k] = (form.get(pre + k) or "").strip()
+    if c["address"] and not HOST_RE.match(c["address"]):
+        raise ValueError("Address نامعتبر است")
+    if c["port"] and not (c["port"].isdigit() and 1 <= int(c["port"]) <= 65535):
+        raise ValueError("پورت نامعتبر است")
+    if c["id"] and (len(c["id"]) > 300 or re.search(r"[\s@/?#]", c["id"])):
+        raise ValueError("UUID / رمز نامعتبر است")
+    if len(c["remark"]) > 80 or "\n" in c["remark"] or len(c["name"]) > 40:
+        raise ValueError("نام یا Remark نامعتبر است")
+    params = {k: (form.get(f"{pre}p_{k}") or "").strip() for k in field_keys(old)}
+    nk, nv = (form.get(pre + "newk") or "").strip(), (form.get(pre + "newv") or "").strip()
+    if nk:
+        if not KEY_RE.match(nk):
+            raise ValueError("نام فیلد جدید نامعتبر است")
+        params[nk] = nv
+    if any(len(v) > 4000 for v in params.values()):
+        raise ValueError("یکی از مقادیر خیلی طولانی است")
+    c["params"] = params
+    return c
+
+
+def build_configs(uid=None):
     res = []
-    for i, op in enumerate(ops):
+    for i, op in enumerate(get_ops()):
         try:
-            link = transform(tpl, op) if tpl else ""
-            err = None if tpl else "هنوز کانفیگی ثبت نشده"
+            link, err = build_link(dict(op, id=uid or op["id"])), None
         except ValueError as e:
             link, err = "", str(e)
-        res.append({"name": op["name"] or f"اپراتور {i + 1}", "link": link, "err": err})
+        res.append({"name": op["name"] or f"اپراتور {i + 1}", "link": link, "err": err, "empty": not (op["address"] or op["id"])})
     return res
 
 
@@ -257,7 +311,7 @@ def ctx():
 def headers(r):
     n = g.get("nonce", "")
     r.headers["Content-Security-Policy"] = (
-        f"default-src 'none'; style-src 'nonce-{n}'; script-src 'nonce-{n}'; "
+        f"default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'nonce-{n}'; "
         "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
     r.headers["X-Content-Type-Options"] = "nosniff"
     r.headers["X-Frame-Options"] = "DENY"
@@ -311,7 +365,7 @@ def configs():
     if not user_valid(u) or time.time() - session.get("ut", 0) > 43200:
         session.clear()
         return redirect("/")
-    return render_template("configs.html", name=u["name"], cfgs=build_configs())
+    return render_template("configs.html", name=u["name"], cfgs=build_configs(u["uuid"]))
 
 
 @app.route("/logout", methods=["POST"])
@@ -349,57 +403,207 @@ def admin_logout():
     return redirect(A + "/login")
 
 
+def field_rows(op):
+    rows = []
+    for k in field_keys(op):
+        v = op["params"].get(k, "")
+        rows.append((k, v, k in LONG_KEYS or len(v) > 50))
+    return rows
+
+
 @app.route(A)
 @admin_required
 def admin_home():
     users = db().execute("select * from users order by id desc").fetchall()
-    ops = get_setting("ops", [dict(EMPTY_OP), dict(EMPTY_OP)])
+    ops = get_ops()
     return render_template("admin.html", users=users, ops=ops,
-                           tpl=get_setting("template", ""), cfgs=build_configs(),
+                           rows=[field_rows(o) for o in ops], cfgs=build_configs(),
                            now=int(time.time()))
 
 
-@app.route(A + "/save", methods=["POST"])
+@app.route(A + "/op/<int:i>/<action>", methods=["POST"])
 @admin_required
-def admin_save():
-    tpl = (request.form.get("template") or "").strip()
+def op_action(i, action):
+    if not 0 <= i < N_OPS or action not in ("parse", "save", "copy"):
+        abort(404)
+    ops = get_ops()
     try:
-        if "\n" in tpl or not tpl:
-            raise ValueError("فقط یک لینک (در یک خط) وارد کنید")
-        ops = [clean_op(request.form, i) for i in (0, 1)]
-        for op in ops:
-            transform(tpl, op)
+        if action == "parse":
+            c = parse_link(request.form.get("link"))
+            c["name"] = ops[i]["name"]
+            ops[i] = norm_op(c)
+        elif action == "save":
+            ops[i] = read_op(request.form, i, ops[i])
+        else:  # copy از اپراتور دیگر
+            c = norm_op(ops[0])
+            c["name"] = ops[i]["name"]
+            ops[i] = c
     except ValueError as e:
         flash(str(e), "err")
         return redirect(A)
-    set_setting("template", tpl)
     set_setting("ops", ops)
     flash("ذخیره شد.", "ok")
     return redirect(A)
 
 
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+# ------------------------------------------------------------ اتصال به 3x-ui (فقط خواندن)
+_xui_cache = {"t": 0, "v": None}
+
+
+def _xui_call(opener, base, method, path, form=None):
+    h = {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest",
+         "User-Agent": "Mozilla/5.0 (compatible; V2rayPanel/1.0)"}
+    if os.environ.get("XUI_TOKEN"):
+        h["Authorization"] = "Bearer " + os.environ["XUI_TOKEN"]
+    body = None
+    if form is not None:
+        body = urllib.parse.urlencode(form).encode()
+        h["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(base + path, data=body, method=method, headers=h)
+    try:
+        with opener.open(req, timeout=6) as r:
+            raw = r.read(8_000_000)
+    except urllib.error.HTTPError as e:
+        try:
+            snip = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", e.read(3000).decode("utf-8", "replace"))).strip()[:150]
+        except Exception:
+            snip = ""
+        cf = " (از Cloudflare)" if "cloudflare" in str(e.headers.get("Server", "")).lower() else ""
+        raise RuntimeError(f"HTTP {e.code} از {path}{cf}" + (f" — {snip}" if snip else ""))
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"اتصال به 3x-ui ممکن نیست: {getattr(e, 'reason', e)}")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise RuntimeError(f"پاسخ نامعتبر از {path} (آدرس یا مسیر پایه اشتباه است؟)")
+
+
+def xui_clients():
+    """همه کلاینت‌های 3x-ui را می‌خواند (کش ۱۵ ثانیه‌ای)."""
+    now = time.time()
+    if _xui_cache["v"] is not None and now - _xui_cache["t"] < 15:
+        return _xui_cache["v"]
+    base = os.environ.get("XUI_URL", "").rstrip("/")
+    if not base:
+        raise RuntimeError("XUI_URL تنظیم نشده است")
+    ctx = ssl._create_unverified_context() if os.environ.get("XUI_VERIFY", "1") != "1" else None
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()),
+                                         urllib.request.HTTPSHandler(context=ctx))
+    if not os.environ.get("XUI_TOKEN"):
+        u, p = os.environ.get("XUI_USER"), os.environ.get("XUI_PASS")
+        if not (u and p):
+            raise RuntimeError("XUI_TOKEN یا XUI_USER و XUI_PASS را تنظیم کنید")
+        r = _xui_call(opener, base, "POST", "/login", {"username": u, "password": p})
+        if not r.get("success"):
+            raise RuntimeError("ورود به 3x-ui ناموفق: " + str(r.get("msg", ""))[:100])
+    try:
+        r = _xui_call(opener, base, "GET", "/panel/api/inbounds/list")
+    except RuntimeError as e:
+        if "HTTP 404" not in str(e):
+            raise
+        r = _xui_call(opener, base, "POST", "/panel/inbound/list", {})
+    if not r.get("success"):
+        raise RuntimeError("3x-ui: " + str(r.get("msg", ""))[:100])
+    out = []
+    for ib in r.get("obj") or []:
+        try:
+            cfg = ib.get("settings") or {}
+            clients = (json.loads(cfg) if isinstance(cfg, (str, bytes)) else cfg).get("clients") or ib.get("clients") or []
+        except (ValueError, TypeError, AttributeError):
+            continue
+        stats = {s.get("email"): s for s in (ib.get("clientStats") or []) if isinstance(s, dict)}
+        for c in clients:
+            if not isinstance(c, dict):
+                continue
+            st = stats.get(c.get("email"), {})
+            out.append({
+                "uuid": str(c.get("id") or c.get("password") or ""),
+                "email": str(c.get("email") or ""),
+                "name": str(c.get("comment") or c.get("email") or ""),
+                "enable": bool(c.get("enable", True)) and bool(st.get("enable", True)),
+                "used": int(st.get("up") or 0) + int(st.get("down") or 0),
+                "total": int(c.get("totalGB") or st.get("total") or 0),
+                "expiry": int(c.get("expiryTime") or st.get("expiryTime") or 0),
+                "inbound": str(ib.get("remark") or ib.get("id") or ""),
+                "protocol": str(ib.get("protocol") or ""),
+            })
+    _xui_cache.update(t=now, v=out)
+    return out
+
+
+@app.route(A + "/xui")
+@admin_required
+def admin_xui():
+    err, rows, missing = None, [], []
+    try:
+        clients = xui_clients()
+    except RuntimeError as e:
+        clients, err = [], str(e)
+    mine = {(r["uuid"] or "").lower(): r["name"]
+            for r in db().execute("select name, uuid from users")}
+    now_ms = int(time.time() * 1000)
+    for c in clients:
+        if c["total"] > 0 and c["used"] >= c["total"]:
+            state = "اتمام حجم"
+        elif c["expiry"] > 0 and c["expiry"] < now_ms:
+            state = "منقضی"
+        elif not c["enable"]:
+            state = "غیرفعال"
+        else:
+            state = "فعال"
+        if c["expiry"] > 0:
+            exp = time.strftime("%Y-%m-%d", time.localtime(c["expiry"] / 1000))
+        elif c["expiry"] < 0:
+            exp = f"{round(-c['expiry'] / 86400000)} روز پس از اولین اتصال"
+        else:
+            exp = "نامحدود"
+        used = f"{c['used'] / 2**30:.2f} / " + (f"{c['total'] / 2**30:.0f} GB" if c["total"] else "نامحدود")
+        rows.append(dict(c, state=state, exp=exp, usedtxt=used,
+                         inpanel=c["uuid"].lower() in mine))
+    have = {c["uuid"].lower() for c in clients}
+    if clients:
+        missing = [n for u, n in mine.items() if u and u not in have]
+    return render_template("xui.html", err=err, rows=rows, missing=missing,
+                           n_ok=sum(r["state"] == "فعال" for r in rows),
+                           n_out=sum(not r["inpanel"] for r in rows))
+
+
 @app.route(A + "/user_add", methods=["POST"])
 @admin_required
 def user_add():
-    name = (request.form.get("name") or "").strip()[:60]
-    custom = norm_code(request.form.get("code"))
     days = (request.form.get("days") or "").strip()
-    if not name:
-        flash("نام کاربر لازم است.", "err")
-        return redirect(A)
-    if custom and len(custom) < 10:
-        flash("کد دلخواه باید حداقل ۱۰ حرف/عدد باشد.", "err")
-        return redirect(A)
-    code = custom or gen_code()
     exp = int(time.time()) + int(days) * 86400 if days.isdigit() and int(days) > 0 else None
-    try:
-        db().execute("insert into users(name,code_hash,expires_at,created) values(?,?,?,?)",
-                     (name, code_hash(norm_code(code)), exp, int(time.time())))
-        db().commit()
-    except sqlite3.IntegrityError:
-        flash("این کد قبلاً استفاده شده.", "err")
-        return redirect(A)
-    flash(f"کاربر {name} ساخته شد. کد ورود: {code}  (فقط همین یک بار نمایش داده می‌شود)", "ok")
+    ok, errs = 0, []
+    for ln in (request.form.get("users") or "").splitlines()[:200]:
+        parts = [p for p in re.split(r"[\s,;]+", ln.strip()) if p]
+        if not parts:
+            continue
+        last = parts[-1]
+        has_id = bool(UUID_RE.match(last))
+        if not has_id and len(last) >= 30:
+            errs.append(f"UUID نامعتبر: {last[:40]}")
+            continue
+        name = " ".join(parts[:-1] if has_id else parts)[:60]
+        if not name:
+            errs.append(f"نام ندارد: {ln[:40]}")
+            continue
+        uid = last.lower() if has_id else str(_uuid.uuid4())
+        try:
+            db().execute("insert into users(name,uuid,code_hash,expires_at,created) values(?,?,?,?,?)",
+                         (name, uid, code_hash(norm_code(uid)), exp, int(time.time())))
+            ok += 1
+        except sqlite3.IntegrityError:
+            errs.append(f"UUID تکراری: {name}")
+    db().commit()
+    if ok:
+        flash(f"{ok} کاربر اضافه شد. UUID هر کاربر را در جدول پایین ببینید و روی سرور هم تعریف کنید.", "ok")
+    for e in errs:
+        flash(e, "err")
+    if not ok and not errs:
+        flash("چیزی وارد نشد.", "err")
     return redirect(A)
 
 
@@ -411,10 +615,6 @@ def user_action(uid, action):
         d.execute("update users set active=1-active where id=?", (uid,))
     elif action == "delete":
         d.execute("delete from users where id=?", (uid,))
-    elif action == "regen":
-        code = gen_code()
-        d.execute("update users set code_hash=? where id=?", (code_hash(norm_code(code)), uid))
-        flash(f"کد جدید: {code}  (فقط همین یک بار نمایش داده می‌شود)", "ok")
     else:
         abort(404)
     d.commit()
@@ -424,39 +624,83 @@ def user_action(uid, action):
 # ---------------------------------------------------------------- قالب‌ها
 
 T = {}
+T["xui.html"] = """{% extends "base.html" %}{% block body %}
+<div class="card"><b>وضعیت UUIDها در 3x-ui</b>
+<a href="{{ A }}"><button type="button" class="s">بازگشت</button></a>
+<a href="{{ A }}/xui"><button type="button">بروزرسانی</button></a></div>
+{% if err %}<div class="msg err">{{ err }}</div>
+<div class="card"><small>برای اتصال، در فایل سرویس XUI_URL و (XUI_TOKEN یا XUI_USER و XUI_PASS) را تنظیم کنید.</small></div>
+{% else %}
+<div class="card"><small>{{ rows|length }} کلاینت — فعال: {{ n_ok }} — در پنل تعریف نشده: {{ n_out }}</small>
+<input id="q" placeholder="جستجوی نام یا UUID">
+<div style="overflow-x:auto"><table id="t">
+<tr><th>نام (کامنت)</th><th>UUID</th><th>وضعیت</th><th>مصرف</th><th>انقضا</th><th>اینباند</th><th>در پنل</th></tr>
+{% for r in rows %}<tr><td>{{ r.name }}{% if r.email and r.email != r.name %}<br><small>{{ r.email }}</small>{% endif %}</td>
+<td class="u">{{ r.uuid }}</td><td>{{ r.state }}</td><td>{{ r.usedtxt }}</td><td>{{ r.exp }}</td><td>{{ r.inbound }}</td>
+<td>{{ '✓' if r.inpanel else '✗' }}</td></tr>{% endfor %}
+</table></div></div>
+{% if missing %}<div class="card"><b>کاربران پنل که UUIDشان در 3x-ui نیست</b><br>{{ missing|join('، ') }}</div>{% endif %}
+<script nonce="{{ nonce }}">
+document.getElementById('q').oninput=function(){var v=this.value.toLowerCase();
+document.querySelectorAll('#t tr').forEach(function(r,i){if(i)r.style.display=r.textContent.toLowerCase().indexOf(v)<0?'none':''})};
+</script>{% endif %}{% endblock %}"""
 T["base.html"] = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
 <title>{% block title %}پنل{% endblock %}</title>
-<style nonce="{{ nonce }}">
-body{font-family:Tahoma,sans-serif;background:#f3f4f6;margin:0;color:#111}
-.w{max-width:760px;margin:0 auto;padding:16px}
-.card{background:#fff;border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 1px 3px #0002}
-input,textarea{width:100%;box-sizing:border-box;padding:9px;margin:4px 0 10px;border:1px solid #ccc;border-radius:6px;font-size:15px}
-textarea{direction:ltr;font-family:monospace;font-size:13px}
-button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:9px 16px;font-size:15px;cursor:pointer}
-button.s{background:#6b7280}button.d{background:#dc2626}
-.msg{padding:10px;border-radius:6px;margin:10px 0;word-break:break-all}
-.ok{background:#dcfce7}.err{background:#fee2e2}
-table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px;border-bottom:1px solid #eee;text-align:right}
-form.i{display:inline}.g{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
-fieldset{border:1px solid #ddd;border-radius:8px;margin:10px 0}small{color:#555}
-</style></head><body><div class="w">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap">
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel2:#0d1425;--text:#edf2ff;--muted:#a5b1ca;--border:#293550;--accent:#7c9cff;--accent2:#98b0ff;--good:#69d6a2;--bad:#ff929b}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(ellipse at top,#172448 0%,var(--bg) 52%) fixed;color:var(--text);font-family:"Vazirmatn",Tahoma,sans-serif;line-height:1.7}
+.w{width:min(920px,calc(100% - 28px));margin:34px auto}
+.eyebrow{color:var(--accent);font-size:.88rem;font-weight:700;letter-spacing:.04em}
+.card{margin:18px 0;padding:clamp(16px,3vw,26px);background:rgba(18,26,45,.94);border:1px solid var(--border);border-radius:18px;box-shadow:0 16px 44px rgba(0,0,0,.18);overflow-x:auto}
+h2,h3{margin:0 0 12px;font-size:1.15rem}
+label{display:block;margin:10px 0 8px;font-weight:600}
+input,textarea{display:block;width:100%;margin:0 0 10px;padding:12px 14px;border:1px solid #354463;border-radius:12px;background:var(--panel2);color:#e6edff;font:inherit}
+textarea{direction:ltr;text-align:left;font:13px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;resize:vertical}
+input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:2px}
+input:disabled{opacity:.6}
+::placeholder{color:#6f7d9c}
+button{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:10px;padding:10px 17px;font:inherit;font-weight:700;color:#0a1230;background:var(--accent);cursor:pointer;transition:transform .12s ease,background .12s ease}
+button:hover{transform:translateY(-1px);background:var(--accent2)}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+button.s{color:var(--text);background:#26334f;border:1px solid #3b4a6b}
+button.s:hover{background:#304060}
+button.d{color:#ffd9dd;background:#4a2430;border:1px solid #7a3a4a}
+button.d:hover{background:#5b2c3a}
+.msg{padding:12px 14px;border-radius:12px;margin:12px 0;word-break:break-all;border:1px solid}
+.ok{color:var(--good);background:rgba(105,214,162,.1);border-color:rgba(105,214,162,.35)}
+.err{color:var(--bad);background:rgba(255,146,155,.1);border-color:rgba(255,146,155,.35)}
+table{width:100%;border-collapse:collapse;font-size:.88rem}
+td,th{padding:8px 6px;border-bottom:1px solid var(--border);text-align:right}
+th{color:var(--muted);font-weight:600}
+form.i{display:inline}
+.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:0 10px}
+.w2{grid-column:1/-1}
+hr{border:0;border-top:1px solid var(--border);margin:14px 0}
+small{color:var(--muted)}
+.u{direction:ltr;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;word-break:break-all}
+td.u{white-space:nowrap;word-break:normal}
+@media(max-width:560px){.w{margin:22px auto}}
+@media(prefers-reduced-motion:reduce){button{transition:none}button:hover{transform:none}}
+</style></head><body><div class="w"><div class="eyebrow">VLESS · پنل کانفیگ</div>
 {% with m = get_flashed_messages(with_categories=true) %}{% for c,t in m %}<div class="msg {{ c }}">{{ t }}</div>{% endfor %}{% endwith %}
 {% block body %}{% endblock %}</div></body></html>"""
 
 T["index.html"] = """{% extends "base.html" %}{% block body %}
 <div class="card"><h2>ورود</h2><form method="post" autocomplete="off">
 <input type="hidden" name="csrf" value="{{ csrf() }}">
-<label>کد ورود</label><input name="code" dir="ltr" required autofocus>
+<label>UUID کانفیگ شما</label><input name="code" dir="ltr" required autofocus>
 <button>ورود</button></form></div>{% endblock %}"""
 
 T["configs.html"] = """{% extends "base.html" %}{% block body %}
 <div class="card"><b>سلام {{ name }}</b>
 <form method="post" action="/logout" class="i"><input type="hidden" name="csrf" value="{{ csrf() }}"> <button class="s">خروج</button></form></div>
-{% for c in cfgs %}<div class="card"><h3>{{ c.name }}</h3>
+{% for c in cfgs if not c.empty %}<div class="card"><h3>{{ c.name }}</h3>
 {% if c.err %}<div class="msg err">{{ c.err }}</div>{% else %}
 <textarea id="c{{ loop.index }}" rows="4" readonly>{{ c.link }}</textarea>
-<button data-copy="c{{ loop.index }}">کپی</button>{% endif %}</div>{% endfor %}
+<button data-copy="c{{ loop.index }}">کپی</button>{% endif %}</div>{% endfor %}{% if cfgs|rejectattr("empty")|list|length == 0 %}<div class="card">هنوز کانفیگی برای شما تعریف نشده است.</div>{% endif %}
 <script nonce="{{ nonce }}">
 document.querySelectorAll('[data-copy]').forEach(function(b){b.onclick=function(){
 var t=document.getElementById(b.dataset.copy);t.select();
@@ -473,41 +717,53 @@ T["admin_login.html"] = """{% extends "base.html" %}{% block body %}
 
 T["admin.html"] = """{% extends "base.html" %}{% block body %}
 <div class="card"><b>پنل مدیریت</b>
+<a href="{{ A }}/xui"><button type="button" class="s">وضعیت 3x-ui</button></a>
 <form method="post" action="{{ A }}/logout" class="i"><input type="hidden" name="csrf" value="{{ csrf() }}"> <button class="s">خروج</button></form></div>
 
-<div class="card"><h3>کانفیگ اصلی و تنظیم اپراتورها</h3>
-<form method="post" action="{{ A }}/save"><input type="hidden" name="csrf" value="{{ csrf() }}">
-<label>لینک کانفیگ (vless / vmess / trojan / ss)</label>
-<textarea name="template" rows="4" required>{{ tpl }}</textarea>
-<small>فیلدهای خالی = بدون تغییر نسبت به کانفیگ اصلی</small>
-{% for i in (0,1) %}<fieldset><legend>اپراتور {{ i+1 }}</legend><div class="g">
-<div><label>نام نمایشی</label><input name="op{{ i }}_name" value="{{ ops[i].name }}"></div>
-<div><label>Remark (نام کانفیگ)</label><input name="op{{ i }}_remark" value="{{ ops[i].remark }}"></div>
-<div><label>Address (IP/دامنه)</label><input dir="ltr" name="op{{ i }}_address" value="{{ ops[i].address }}"></div>
-<div><label>Port</label><input dir="ltr" name="op{{ i }}_port" value="{{ ops[i].port }}"></div>
-<div><label>SNI</label><input dir="ltr" name="op{{ i }}_sni" value="{{ ops[i].sni }}"></div>
-<div><label>Host header</label><input dir="ltr" name="op{{ i }}_host" value="{{ ops[i].host }}"></div>
-</div></fieldset>{% endfor %}
-<button>ذخیره</button></form></div>
+{% for i in range(ops|length) %}{% set op = ops[i] %}
+<div class="card"><h3>اپراتور {{ i+1 }}{% if op.name %} — {{ op.name }}{% endif %}</h3>
 
-<div class="card"><h3>پیش‌نمایش</h3>
-{% for c in cfgs %}<b>{{ c.name }}</b>{% if c.err %}<div class="msg err">{{ c.err }}</div>{% else %}
-<textarea rows="3" readonly>{{ c.link }}</textarea>{% endif %}{% endfor %}</div>
+<form method="post" action="{{ A }}/op/{{ i }}/parse"><input type="hidden" name="csrf" value="{{ csrf() }}">
+<label>لینک کانفیگ را اینجا بچسبانید</label>
+<textarea name="link" rows="3" placeholder="vless://..."></textarea>
+<button>تجزیه و پر کردن فیلدها</button></form>
+<hr>
+<form method="post" action="{{ A }}/op/{{ i }}/save"><input type="hidden" name="csrf" value="{{ csrf() }}">
+<div class="g">
+<div><label>نام نمایشی (برای کاربر)</label><input name="op{{ i }}_name" value="{{ op.name }}"></div>
+<div><label>Remark (نام کانفیگ)</label><input name="op{{ i }}_remark" value="{{ op.remark }}"></div>
+<div><label>پروتکل</label><input dir="ltr" value="{{ op.scheme }}" disabled></div>
+<div><label>UUID / Password</label><input dir="ltr" name="op{{ i }}_id" value="{{ op.id }}"></div>
+<div><label>Address</label><input dir="ltr" name="op{{ i }}_address" value="{{ op.address }}"></div>
+<div><label>Port</label><input dir="ltr" name="op{{ i }}_port" value="{{ op.port }}"></div>
+{% for k,v,long in rows[i] %}<div class="{{ 'w2' if long }}"><label>{{ k }}</label>
+{% if long %}<textarea name="op{{ i }}_p_{{ k }}" rows="3">{{ v }}</textarea>{% else %}<input dir="ltr" name="op{{ i }}_p_{{ k }}" value="{{ v }}">{% endif %}</div>{% endfor %}
+<div><label>فیلد جدید: نام</label><input dir="ltr" name="op{{ i }}_newk"></div>
+<div><label>فیلد جدید: مقدار</label><input dir="ltr" name="op{{ i }}_newv"></div>
+</div>
+<small>فیلد خالی در لینک نهایی قرار نمی‌گیرد.</small><br>
+<button>ذخیره</button></form>
+{% if i > 0 %}<form method="post" action="{{ A }}/op/{{ i }}/copy" class="i"><input type="hidden" name="csrf" value="{{ csrf() }}"><button class="s">کپی همه فیلدها از اپراتور ۱</button></form>{% endif %}
+
+<label>لینک نهایی</label>
+{% if cfgs[i].err %}<div class="msg err">{{ cfgs[i].err }}</div>{% else %}<textarea rows="3" readonly>{{ cfgs[i].link }}</textarea>{% endif %}
+</div>{% endfor %}
 
 <div class="card"><h3>افزودن کاربر</h3>
 <form method="post" action="{{ A }}/user_add" autocomplete="off"><input type="hidden" name="csrf" value="{{ csrf() }}">
-<div class="g"><div><label>نام کاربر</label><input name="name" required></div>
-<div><label>مدت اعتبار (روز، اختیاری)</label><input name="days" dir="ltr"></div></div>
-<label>کد ورود دلخواه (اختیاری، حداقل ۱۰ حرف/عدد؛ خالی = ساخت خودکار)</label><input name="code" dir="ltr">
-<button>افزودن</button></form></div>
+<label>هر خط یک کاربر: «نام UUID» (اگر UUID ننویسید، خودکار ساخته می‌شود)</label>
+<textarea name="users" rows="5" placeholder="ali 7e2009ee-9be3-4011-899d-784aeeda1a4b"></textarea>
+<label>مدت اعتبار (روز، اختیاری)</label><input name="days" dir="ltr">
+<button>افزودن</button></form>
+<small>همین UUID باید روی سرور (inbound) هم تعریف شده باشد.</small></div>
 
 <div class="card"><h3>کاربران ({{ users|length }})</h3><table>
-<tr><th>نام</th><th>وضعیت</th><th>انقضا</th><th>آخرین ورود</th><th></th></tr>
-{% for u in users %}<tr><td>{{ u.name }}</td>
+<tr><th>نام</th><th>UUID</th><th>وضعیت</th><th>انقضا</th><th>آخرین ورود</th><th></th></tr>
+{% for u in users %}<tr><td>{{ u.name }}</td><td class="u">{{ u.uuid or '-' }}</td>
 <td>{% if not u.active %}غیرفعال{% elif u.expires_at and u.expires_at < now %}منقضی{% else %}فعال{% endif %}</td>
 <td>{{ (u.expires_at|int|timestamp) if u.expires_at else '-' }}</td>
 <td>{{ (u.last_login|int|timestamp) if u.last_login else '-' }}</td>
-<td>{% for a,l,c in (('toggle','فعال/غیرفعال','s'),('regen','کد جدید','s'),('delete','حذف','d')) %}
+<td>{% for a,l,c in (('toggle','فعال/غیرفعال','s'),('delete','حذف','d')) %}
 <form method="post" action="{{ A }}/user/{{ u.id }}/{{ a }}" class="i"><input type="hidden" name="csrf" value="{{ csrf() }}"><button class="{{ c }}">{{ l }}</button></form> {% endfor %}</td></tr>{% endfor %}
 </table></div>{% endblock %}"""
 

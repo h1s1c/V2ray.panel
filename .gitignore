@@ -5,3 +5,7 @@ __pycache__/
 *.db
 secret.key
 .env
+*.bak
+*.bak*
+*.swp
+*~
